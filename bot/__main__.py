@@ -1,19 +1,20 @@
 """
 Точка входа: вебхук-сервер для Render.
-Запуск: gunicorn -k uvicorn.workers.UvicornWorker bot.__main__:app
+Запуск: gunicorn -k aiohttp.GunicornWebWorker bot.__main__:app --bind 0.0.0.0:$PORT
 """
 import logging
 import sys
 from aiohttp import web
 
-from aiogram import Bot, Dispatcher, Router
+from aiogram import Bot, Dispatcher, Router, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.filters import Command, CommandStart
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import Message
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
 from bot.config import settings
-from bot.handlers import setup_routers
 
 logging.basicConfig(
     level=logging.INFO,
@@ -26,23 +27,21 @@ logger = logging.getLogger(__name__)
 router = Router()
 
 
-# ========== Базовые хэндлеры ==========
-@router.message(commands=["start"])
-async def cmd_start(message):
+# ========== Хэндлеры (исправленный синтаксис aiogram 3.x) ==========
+@router.message(CommandStart())
+async def cmd_start(message: Message):
     await message.answer(
         "🗳️ *Бот анализа предвыборной программы*\n\n"
         "📌 Отправьте текст программы — я проверю:\n"
         "• Полноту разделов (проблемы, решения, сроки)\n"
         "• Конкретику (адреса, цифры, ответственные)\n"
-        "• Предложу улучшения по шаблону\n\n"
-        "🔹 Также можно отправить ссылку на публичную страницу — "
-        "я попробую извлечь текст для анализа.",
+        "• Предложу улучшения по шаблону",
         parse_mode=ParseMode.MARKDOWN
     )
 
 
-@router.message(commands=["help"])
-async def cmd_help(message):
+@router.message(Command("help"))
+async def cmd_help(message: Message):
     await message.answer(
         "📚 *Команды:*\n"
         "/start — начать работу\n"
@@ -51,65 +50,101 @@ async def cmd_help(message):
     )
 
 
-@router.message()
-async def handle_input(message):
-    """Обрабатывает текст или ссылку"""
+@router.message(F.text)
+async def handle_input(message: Message):
+    """Обрабатывает текст программы"""
     text = message.text or ""
     
-    # Если ссылка — пробуем спарсить
+    # Если ссылка — пробуем спарсить (опционально)
     if text.startswith("http"):
         await message.answer("🔄 Извлекаю текст со страницы...")
         from bot.services.fetcher import fetch_page_text
         page_text = await fetch_page_text(text)
-        
         if page_text:
-            await message.answer(f"📄 Найдено ~{len(page_text)} символов. Анализирую...")
-            result = analyze_text(page_text)
+            text = page_text
         else:
-            await message.answer("❌ Не удалось извлечь текст. Попробуйте отправить программу напрямую.")
+            await message.answer("❌ Не удалось извлечь текст. Отправьте программу напрямую.")
             return
-    else:
-        # Прямой анализ текста
-        await message.answer("🔄 Анализирую программу...")
-        result = analyze_text(text)
     
-    # Формируем ответ
+    # Анализ текста
+    await message.answer("🔄 Анализирую программу...")
+    result = analyze_text(text)
     response = format_analysis_result(result)
     await message.answer(response, parse_mode=ParseMode.MARKDOWN)
 
 
-# ========== Анализ (правиловый) ==========
+# ========== Логика анализа (правиловый анализатор) ==========
 def analyze_text(text: str) -> dict:
-    """Простой анализ текста на основе правил"""
-    from bot.services.analyzer import RuleBasedAnalyzer
-    return RuleBasedAnalyzer.analyze(text)
+    """Простой анализ на основе ключевых слов"""
+    import re
+    text_lower = text.lower()
+    
+    strengths = []
+    improvements = []
+    missing = []
+    
+    # Проверка разделов
+    sections = [
+        (r'проблем|вызов|задач', "Описание проблем"),
+        (r'предлага|предложени|мера|инициатив', "Конкретные предложения"),
+        (r'срок|этап|график|202[4-9]', "Сроки реализации"),
+        (r'бюджет|финанс|средств', "Финансирование"),
+        (r'адрес|улиц|территори', "Привязка к адресам"),
+    ]
+    
+    for pattern, label in sections:
+        if re.search(pattern, text_lower):
+            strengths.append(label)
+    
+    # Проверка на отсутствие важного
+    if not re.search(r'срок|этап|график|202[4-9]', text_lower):
+        missing.append("Сроки реализации")
+        improvements.append("Добавьте сроки: 'до конца 2025', 'в два этапа'")
+    
+    if not re.search(r'бюджет|финанс|средств|источник', text_lower):
+        missing.append("Источники финансирования")
+        improvements.append("Укажите источник: 'муниципальный бюджет', 'грант'")
+    
+    if not re.search(r'адрес|улиц|дом|микрорайон', text_lower):
+        missing.append("Привязка к адресам")
+        improvements.append("Добавьте адреса: 'ул. Ленина, д. 1-15'")
+    
+    # Проверка на "воду"
+    vague = sum(1 for p in [r'улучшить.*жизнь', r'повысить.*уровень', r'создать.*услови'] 
+                if re.search(p, text_lower))
+    if vague >= 2:
+        improvements.append("Замените общие фразы на конкретные действия с цифрами")
+    
+    # Объём текста
+    if len(text.split()) < 200:
+        improvements.insert(0, "Раскройте программу подробнее — добавьте детали")
+    
+    return {
+        "strengths": strengths if strengths else ["Программа структурирована"],
+        "improvements": improvements if improvements else ["Программа соответствует базовым требованиям"],
+        "missing": missing
+    }
 
 
 def format_analysis_result(result: dict) -> str:
-    """Форматирует результат анализа в читаемый ответ"""
-    sections = []
+    """Форматирует ответ пользователю"""
+    parts = []
     
     if result["strengths"]:
-        sections.append("✅ *Сильные стороны:*")
-        for s in result["strengths"]:
-            sections.append(f"• {s}")
+        parts.append("✅ *Сильные стороны:*")
+        parts.extend(f"• {s}" for s in result["strengths"])
     
-    if result["improvements"]:
-        sections.append("\n💡 *Предложения по улучшению:*")
-        for i, imp in enumerate(result["improvements"], 1):
-            sections.append(f"{i}. {imp}")
+    parts.append("\n💡 *Предложения:*")
+    parts.extend(f"{i}. {imp}" for i, imp in enumerate(result["improvements"], 1))
     
     if result["missing"]:
-        sections.append("\n⚠️ *Чего не хватает:*")
-        for m in result["missing"]:
-            sections.append(f"• {m}")
+        parts.append("\n⚠️ *Не хватает:*")
+        parts.extend(f"• {m}" for m in result["missing"])
     
-    sections.append("\n_Анализ выполнен по правилам. Для более глубокого анализа подключите AI-модель._")
-    
-    return "\n".join(sections)
+    return "\n".join(parts)
 
 
-# ========== Webhook setup ==========
+# ========== Webhook setup для Render ==========
 async def on_startup(bot: Bot):
     if settings.webhook_url:
         await bot.set_webhook(
@@ -117,21 +152,19 @@ async def on_startup(bot: Bot):
             secret_token=settings.WEBHOOK_SECRET.get_secret_value() if settings.WEBHOOK_SECRET else None,
             drop_pending_updates=True
         )
-        logger.info(f"✓ Webhook: {settings.webhook_url}")
-    else:
-        logger.warning("⚠ WEBHOOK_BASE_URL не задан — бот не будет получать сообщения на Render")
+        logger.info(f"✓ Webhook set: {settings.webhook_url}")
 
 
 async def on_shutdown(bot: Bot):
     if settings.webhook_url:
         await bot.delete_webhook()
-        logger.info("✓ Webhook удалён")
+        logger.info("✓ Webhook deleted")
 
 
 def create_app() -> web.Application:
+    """Создаёт aiohttp приложение"""
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
-    setup_routers(dp)
     
     dp.startup.register(on_startup)
     dp.shutdown.register(on_shutdown)
@@ -144,11 +177,7 @@ def create_app() -> web.Application:
     app = web.Application()
     
     # Webhook handler
-    if settings.WEBHOOK_SECRET:
-        secret = settings.WEBHOOK_SECRET.get_secret_value()
-    else:
-        secret = None
-    
+    secret = settings.WEBHOOK_SECRET.get_secret_value() if settings.WEBHOOK_SECRET else None
     webhook_handler = SimpleRequestHandler(
         dispatcher=dp,
         bot=bot,
@@ -157,13 +186,12 @@ def create_app() -> web.Application:
     )
     webhook_handler.register(app, path=settings.WEBHOOK_PATH)
     
-    # Health check для Render
+    # Health check
     async def health_handler(request):
-        return web.json_response({"status": "ok", "version": "0.1.0"})
+        return web.json_response({"status": "ok"})
     app.router.add_get("/health", health_handler)
     
     setup_application(app, dp, bot=bot)
-    
     return app
 
 
